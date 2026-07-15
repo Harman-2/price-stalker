@@ -1,84 +1,61 @@
-import os
-from dotenv import load_dotenv
-from elasticsearch import Elasticsearch
+import argparse
 from datetime import datetime, timedelta
 
-load_dotenv(dotenv_path="../.env")
-
-es = Elasticsearch(
-    os.getenv("ELASTIC_ENDPOINT"),
-    basic_auth=(
-        os.getenv("ELASTIC_USERNAME"),
-        os.getenv("ELASTIC_PASSWORD")
-    )
-)
+from storage import get_price_history, get_latest_price
 
 def get_price_stats(url):
     """Layer 1 — get min, max, average, and percentiles for this product."""
-    result = es.search(index="price_history", body={
-        "query": {
-            "term": { "url": url }
-        },
-        "aggs": {
-            "min_price":     { "min": { "field": "price" } },
-            "max_price":     { "max": { "field": "price" } },
-            "avg_price":     { "avg": { "field": "price" } },
-            "price_percentiles": {
-                "percentiles": {
-                    "field": "price",
-                    "percents": [20, 50, 80]
-                }
-            }
-        },
-        "size": 0
-    })
+    records = get_price_history(url)
+    if not records:
+        return {"min": None, "max": None, "avg": None, "p20": None, "p50": None, "p80": None, "count": 0}
 
-    aggs = result["aggregations"]
+    prices = [record["price"] for record in records if record.get("price") is not None]
+    if not prices:
+        return {"min": None, "max": None, "avg": None, "p20": None, "p50": None, "p80": None, "count": 0}
+
+    prices = sorted(prices)
+    count = len(prices)
+
+    def percentile(values, pct):
+        if not values:
+            return None
+        index = max(0, min(count - 1, int(round((pct / 100) * (count - 1)))))
+        return values[index]
+
     return {
-        "min":   aggs["min_price"]["value"],
-        "max":   aggs["max_price"]["value"],
-        "avg":   aggs["avg_price"]["value"],
-        "p20":   aggs["price_percentiles"]["values"]["20.0"],
-        "p50":   aggs["price_percentiles"]["values"]["50.0"],
-        "p80":   aggs["price_percentiles"]["values"]["80.0"],
-        "count": result["hits"]["total"]["value"]
+        "min": prices[0],
+        "max": prices[-1],
+        "avg": sum(prices) / count,
+        "p20": percentile(prices, 20),
+        "p50": percentile(prices, 50),
+        "p80": percentile(prices, 80),
+        "count": count,
     }
 
 
 def get_price_trend(url):
     """Layer 2 — is the price going up or down over the last 30 days?"""
-    thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
-
-    result = es.search(index="price_history", body={
-        "query": {
-            "bool": {
-                "must": [
-                    { "term": { "url": url } },
-                    { "range": { "timestamp": { "gte": thirty_days_ago } } }
-                ]
-            }
-        },
-        "aggs": {
-            "prices_over_time": {
-                "date_histogram": {
-                    "field": "timestamp",
-                    "calendar_interval": "week"
-                },
-                "aggs": {
-                    "avg_price": { "avg": { "field": "price" } }
-                }
-            }
-        },
-        "size": 0
-    })
-
-    buckets = result["aggregations"]["prices_over_time"]["buckets"]
-
-    if len(buckets) < 2:
+    records = get_price_history(url)
+    if not records:
         return "stable", []
 
-    prices = [b["avg_price"]["value"] for b in buckets if b["avg_price"]["value"]]
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    recent_records = []
+    for record in records:
+        timestamp = record.get("timestamp")
+        if not timestamp:
+            continue
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError:
+            continue
+        if parsed >= thirty_days_ago:
+            recent_records.append(record)
 
+    if len(recent_records) < 2:
+        return "stable", [record.get("price") for record in recent_records if record.get("price") is not None]
+
+    prices = [record["price"] for record in recent_records if record.get("price") is not None]
     if len(prices) < 2:
         return "stable", prices
 
@@ -99,16 +76,7 @@ def get_price_trend(url):
 
 def get_current_price(url):
     """Get the most recently scraped price for this product."""
-    result = es.search(index="price_history", body={
-        "query": { "term": { "url": url } },
-        "sort": [{ "timestamp": { "order": "desc" } }],
-        "size": 1
-    })
-
-    hits = result["hits"]["hits"]
-    if not hits:
-        return None
-    return hits[0]["_source"]["price"]
+    return get_latest_price(url)
 
 
 def analyze(url):
@@ -183,6 +151,15 @@ def analyze(url):
     }
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Analyze historical price data for a product")
+    parser.add_argument("url", nargs="?", help="Amazon product URL")
+    args = parser.parse_args()
+
+    target_url = args.url or input("Paste the Amazon product URL to analyze: ").strip()
+    if target_url:
+        analyze(target_url)
+
+
 if __name__ == "__main__":
-    url = input("Paste the Amazon product URL to analyze: ").strip()
-    analyze(url)
+    main()

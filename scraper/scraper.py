@@ -1,22 +1,11 @@
+import argparse
 import os
 import re
-import json
 from datetime import datetime
-from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
-from elasticsearch import Elasticsearch
 
-load_dotenv(dotenv_path="../.env")
-
-# Connect to Elastic
-es = Elasticsearch(
-    os.getenv("ELASTIC_ENDPOINT"),
-    basic_auth=(
-        os.getenv("ELASTIC_USERNAME"),
-        os.getenv("ELASTIC_PASSWORD")
-    )
-)
+from storage import save_price_record
 
 HEADERS = {
     "User-Agent": (
@@ -29,8 +18,12 @@ HEADERS = {
 
 def scrape_amazon_price(url):
     """Fetch current price and product name from an Amazon URL."""
+    if not url or not url.startswith("http"):
+        raise ValueError("A valid product URL is required")
+
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
         # Product name
@@ -76,26 +69,34 @@ def scrape_amazon_price(url):
         return None
 
 
-def save_to_elastic(data):
-    """Index the price data point into Elasticsearch."""
-    try:
-        es.index(index="price_history", document=data)
+def save_to_storage(data):
+    """Store the price data point in Elasticsearch or fall back to a local JSON file."""
+    result = save_price_record(data)
+    if result["backend"] == "elasticsearch":
         print(f"Saved to Elastic: ${data['price']} at {data['timestamp']}")
-    except Exception as e:
-        print(f" Elastic save failed: {e}")
+    else:
+        print(f"Saved locally: ${data['price']} at {data['timestamp']}")
 
 
 def scrape_and_save(url):
-    """Main function — scrape price and save to Elastic."""
+    """Main function — scrape price and save it to storage."""
     print(f"\n Scraping: {url}\n")
     data = scrape_amazon_price(url)
     if data:
-        save_to_elastic(data)
+        save_to_storage(data)
         return data
     return None
 
 
-# Test it directly
+def main():
+    parser = argparse.ArgumentParser(description="Scrape an Amazon product price and store it")
+    parser.add_argument("url", nargs="?", help="Amazon product URL")
+    args = parser.parse_args()
+
+    target_url = args.url or input("Paste an Amazon product URL: ").strip()
+    if target_url:
+        scrape_and_save(target_url)
+
+
 if __name__ == "__main__":
-    test_url = input("Paste an Amazon product URL: ").strip()
-    scrape_and_save(test_url)
+    main()
